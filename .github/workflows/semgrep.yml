@@ -1,97 +1,154 @@
-# .github/workflows/semgrep-ssc-compare.yml
-#
-# Runs Semgrep over a corpus of GitHub Actions workflow YAMLs with two
-# configurations and produces a side-by-side comparison:
-#
-#   baseline  = p/github-actions          (exactly what the paper used)
-#   extended  = p/github-actions + your new supply-chain rules
-#
-# The job emits JSON for both runs, aggregates per rule and per weakness, and
-# writes a Markdown report to the job summary plus downloadable artifacts.
-#
-# This is a benchmark job (full scan, no Semgrep Cloud token needed). It uses
-# `semgrep scan`, NOT `semgrep ci` (which is diff-aware and needs SEMGREP_APP_TOKEN).
-
-name: semgrep-supply-chain-compare
+name: Simple Semgrep Comparison
 
 on:
   workflow_dispatch:
     inputs:
       scan_path:
-        description: "Directory of workflow YAMLs to scan"
-        default: "dataset/workflows"
+        description: "YAML file or folder to scan"
         required: true
-  push:
-    paths:
-      - ".github/workflows/semgrep-ssc-compare.yml"
-      - "scripts/compare_semgrep.py"
-      - "custom-rules/**"
+        default: "github-actions-security/dataset/workflows"
 
 permissions:
   contents: read
 
 jobs:
-  scan:
+  semgrep-comparison:
     runs-on: ubuntu-latest
-    container:
-      # Pin to a digest in production for reproducibility, e.g.
-      #   image: semgrep/semgrep@sha256:<digest>
-      image: semgrep/semgrep
+
     env:
-      SCAN_PATH: ${{ github.event.inputs.scan_path || 'dataset/workflows' }}
-      SEMGREP_FLAGS: "--metrics=off --disable-version-check --no-git-ignore --quiet"
+      SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+      SCAN_PATH: ${{ github.event.inputs.scan_path }}
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4   # pin to a commit SHA in production (frizbee/poutine will flag this)
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      # --- Baseline: the paper's exact config --------------------------------
-      - name: Semgrep baseline (p/github-actions)
+      - name: Install Semgrep
         run: |
-          semgrep scan \
-            --config "p/github-actions" \
-            --json --output baseline.json \
-            $SEMGREP_FLAGS \
-            "$SCAN_PATH" || true
+          python3 -m pip install --upgrade pip
+          python3 -m pip install semgrep
+          semgrep --version
 
-      # --- Extended: baseline + your new supply-chain rules ------------------
-      # Drop the rules you want to try into custom-rules/. To also pull in
-      # Trail of Bits' GitHub Actions supply-chain rules, uncomment the clone
-      # step below and add `--config vendor/tob-rules/github_actions`.
-      - name: Semgrep extended (baseline + supply-chain)
+      - name: Prepare results folder
+        run: mkdir -p results
+
+      - name: Run Semgrep GitHub Actions YAML scan
         run: |
+          set +e
+
           semgrep scan \
-            --config "p/github-actions" \
-            --config "custom-rules/" \
-            --json --output extended.json \
-            $SEMGREP_FLAGS \
-            "$SCAN_PATH" || true
+            --config p/github-actions \
+            --json \
+            "$SCAN_PATH" > results/yaml-scan.json
 
-      # - name: Fetch Trail of Bits rules (optional, pinned)
-      #   run: |
-      #     git clone --depth 1 https://github.com/trailofbits/semgrep-rules vendor/tob-rules
-      #     git -C vendor/tob-rules checkout <PINNED_SHA>
+          echo $? > results/yaml-scan.exitcode
 
-      # --- Compare -----------------------------------------------------------
+          if [ ! -s results/yaml-scan.json ]; then
+            echo '{"results":[],"errors":["YAML scan produced no JSON output"]}' > results/yaml-scan.json
+          fi
+
+      - name: Run Semgrep Supply Chain scan
+        run: |
+          set +e
+
+          if [ -z "${SEMGREP_APP_TOKEN:-}" ]; then
+            echo '{"results":[],"errors":["SEMGREP_APP_TOKEN is not set, so Supply Chain scan was skipped"]}' > results/supply-chain.json
+            echo "skipped" > results/supply-chain.exitcode
+            exit 0
+          fi
+
+          semgrep ci \
+            --supply-chain \
+            --json > results/supply-chain.json
+
+          echo $? > results/supply-chain.exitcode
+
+          if [ ! -s results/supply-chain.json ]; then
+            echo '{"results":[],"errors":["Supply Chain scan produced no JSON output"]}' > results/supply-chain.json
+          fi
+
       - name: Compare results
         run: |
-          python3 scripts/compare_semgrep.py \
-            --run baseline:baseline.json \
-            --run extended:extended.json \
-            --out-md  semgrep_compare_report.md \
-            --out-csv semgrep_compare.csv
-          {
-            echo "## Semgrep comparison"
-            cat semgrep_compare_report.md
-          } >> "$GITHUB_STEP_SUMMARY"
+          python3 <<'PY'
+          import json
+          import csv
+          from pathlib import Path
+          from collections import Counter
 
-      - name: Upload artifacts
-        if: always()
-        uses: actions/upload-artifact@v4   # pin to a commit SHA in production
+          result_files = {
+              "github_actions_yaml": Path("results/yaml-scan.json"),
+              "supply_chain": Path("results/supply-chain.json"),
+          }
+
+          totals = []
+          rule_rows = []
+          errors = []
+
+          for scan_name, path in result_files.items():
+              try:
+                  data = json.loads(path.read_text())
+              except Exception as exc:
+                  totals.append([scan_name, 0])
+                  errors.append(f"{scan_name}: failed to read JSON: {exc}")
+                  continue
+
+              results = data.get("results", [])
+              totals.append([scan_name, len(results)])
+
+              for err in data.get("errors", []):
+                  errors.append(f"{scan_name}: {err}")
+
+              rules = Counter(item.get("check_id", "unknown") for item in results)
+              for rule, count in sorted(rules.items()):
+                  rule_rows.append([scan_name, rule, count])
+
+          with open("results/summary.csv", "w", newline="") as f:
+              writer = csv.writer(f)
+              writer.writerow(["scan", "total_findings"])
+              writer.writerows(totals)
+
+          with open("results/rules.csv", "w", newline="") as f:
+              writer = csv.writer(f)
+              writer.writerow(["scan", "rule", "count"])
+              writer.writerows(rule_rows)
+
+          lines = []
+          lines.append("# Semgrep comparison")
+          lines.append("")
+          lines.append("## Total findings")
+          lines.append("")
+          lines.append("| Scan | Total findings |")
+          lines.append("|---|---:|")
+
+          for scan_name, count in totals:
+              lines.append(f"| {scan_name} | {count} |")
+
+          lines.append("")
+          lines.append("## Findings by rule")
+          lines.append("")
+          lines.append("| Scan | Rule | Count |")
+          lines.append("|---|---|---:|")
+
+          for scan_name, rule, count in rule_rows:
+              lines.append(f"| {scan_name} | `{rule}` | {count} |")
+
+          if errors:
+              lines.append("")
+              lines.append("## Errors or skipped scans")
+              lines.append("")
+
+              for err in errors:
+                  lines.append(f"- {err}")
+
+          Path("results/comparison.md").write_text("\n".join(lines) + "\n")
+          print("\n".join(lines))
+          PY
+
+      - name: Add comparison to GitHub summary
+        run: cat results/comparison.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload comparison results
+        uses: actions/upload-artifact@v4
         with:
-          name: semgrep-comparison
-          path: |
-            baseline.json
-            extended.json
-            semgrep_compare_report.md
-            semgrep_compare.csv
-          if-no-files-found: warn
+          name: semgrep-simple-comparison
+          path: results/
