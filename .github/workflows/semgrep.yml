@@ -1,0 +1,164 @@
+name: Semgrep Spring Java SAST, SCA, and YAML Analysis
+
+on:
+  push:
+    branches: ["master", "main", "develop"]
+  pull_request:
+    branches: ["master", "main", "develop"]
+  schedule:
+    - cron: "15 6 * * 2"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  semgrep:
+    name: Semgrep managed SAST and Supply Chain
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+
+    container:
+      # Pin this to an approved digest after validation:
+      # semgrep/semgrep:1.166.0@sha256:<approved-digest>
+      image: semgrep/semgrep:1.166.0
+
+    env:
+      SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Run Semgrep managed SAST and Supply Chain scan
+        run: |
+          semgrep ci \
+            --supply-chain \
+            --sarif \
+            --output semgrep.sarif
+
+      - name: Upload Semgrep SARIF to GitHub Code Scanning
+        if: always() && hashFiles('semgrep.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep-spring-java-sast-sca
+
+  yaml-analysis:
+    name: YAML and GitHub Actions analysis
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+
+    container:
+      image: semgrep/semgrep:1.166.0
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Scan GitHub Actions YAML files
+        run: |
+          semgrep scan \
+            --config p/github-actions \
+            --include ".github/workflows/*.yml" \
+            --include ".github/workflows/*.yaml" \
+            --sarif \
+            --output semgrep-github-actions-yaml.sarif \
+            .
+
+      - name: Upload YAML SARIF to GitHub Code Scanning
+        if: always() && hashFiles('semgrep-github-actions-yaml.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: semgrep-github-actions-yaml.sarif
+          category: semgrep-github-actions-yaml
+
+  dependency-review:
+    name: Dependency Review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Review dependency changes
+        uses: actions/dependency-review-action@v4.8.3
+        with:
+          fail-on-severity: high
+
+  zizmor:
+    name: GitHub Actions workflow security analysis
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Run zizmor
+        uses: zizmorcore/zizmor-action@v0.5.6
+        with:
+          inputs: .github/workflows
+          min-severity: medium
+          min-confidence: medium
+
+  scorecard:
+    name: OpenSSF Scorecard
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+
+    permissions:
+      security-events: write
+      id-token: write
+      contents: read
+      actions: read
+      issues: read
+      pull-requests: read
+      checks: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Run OpenSSF Scorecard
+        uses: ossf/scorecard-action@v2.4.3
+        with:
+          results_file: scorecard.sarif
+          results_format: sarif
+          publish_results: true
+
+      - name: Upload Scorecard SARIF to GitHub Code Scanning
+        if: always() && hashFiles('scorecard.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: scorecard.sarif
+          category: openssf-scorecard
