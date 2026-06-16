@@ -1,309 +1,119 @@
-name: Semgrep YAML Benchmark and Supply Chain Comparison
+name: Simple Semgrep YAML vs Supply Chain Comparison
 
 on:
 workflow_dispatch:
 inputs:
 scan_path:
-description: "Folder or YAML file to scan with Semgrep GitHub Actions rules"
+description: "YAML dataset path"
 required: true
 default: "github-actions-security/dataset/workflows"
-pull_request:
-paths:
-- "github-actions-security/dataset/workflows/**/*.yml"
-- "github-actions-security/dataset/workflows/**/*.yaml"
-- ".github/workflows/**/*.yml"
-- ".github/workflows/**/*.yaml"
-- ".semgrep/**/*.yml"
-- ".semgrep/**/*.yaml"
-push:
-branches: ["main", "master", "develop"]
-paths:
-- "github-actions-security/dataset/workflows/**/*.yml"
-- "github-actions-security/dataset/workflows/**/*.yaml"
-- ".github/workflows/**/*.yml"
-- ".github/workflows/**/*.yaml"
-- ".semgrep/**/*.yml"
-- ".semgrep/**/*.yaml"
-schedule:
-- cron: "15 6 * * 2"
 
 permissions:
 contents: read
-security-events: write
-actions: read
-
-concurrency:
-group: semgrep-yaml-benchmark-${{ github.event.pull_request.number || github.ref }}
-cancel-in-progress: true
 
 jobs:
-semgrep-compare:
-name: Semgrep YAML and Supply Chain comparison
+compare-semgrep:
 runs-on: ubuntu-latest
+container:
+image: semgrep/semgrep:latest
 
 ```
-container:
-  image: semgrep/semgrep:latest
-
 env:
   SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
-  DEFAULT_SCAN_PATH: github-actions-security/dataset/workflows
-  REQUESTED_SCAN_PATH: ${{ github.event.inputs.scan_path }}
+  SCAN_PATH: ${{ github.event.inputs.scan_path }}
 
 steps:
-  - name: Checkout repository
+  - name: Checkout
     uses: actions/checkout@v4
-    with:
-      persist-credentials: false
 
-  - name: Prepare result directory
-    shell: bash
-    run: |
-      set -euo pipefail
+  - name: Prepare results
+    run: mkdir -p results
 
-      mkdir -p results
-
-      if [ -n "${REQUESTED_SCAN_PATH:-}" ]; then
-        echo "SCAN_PATH=${REQUESTED_SCAN_PATH}" >> "$GITHUB_ENV"
-      else
-        echo "SCAN_PATH=${DEFAULT_SCAN_PATH}" >> "$GITHUB_ENV"
-      fi
-
-  - name: Validate scan path
-    shell: bash
-    run: |
-      set -euo pipefail
-
-      if [ ! -e "$SCAN_PATH" ]; then
-        echo "Scan path does not exist: $SCAN_PATH" >&2
-        exit 1
-      fi
-
-      echo "Scanning: $SCAN_PATH"
-      find "$SCAN_PATH" \( -name "*.yml" -o -name "*.yaml" \) | sort > results/scanned-yaml-files.txt
-      echo "YAML files found: $(wc -l < results/scanned-yaml-files.txt)"
-
-  - name: Record Semgrep version
-    shell: bash
-    run: |
-      set -euo pipefail
-      semgrep --version | tee results/semgrep-version.txt
-
-  - name: Run paper-style Semgrep GitHub Actions YAML scan
-    shell: bash
+  - name: Run Semgrep GitHub Actions YAML rules
     run: |
       set +e
-
       semgrep scan \
         --config p/github-actions \
         --include "*.yml" \
         --include "*.yaml" \
-        --json-output results/semgrep-github-actions.json \
-        --sarif-output results/semgrep-github-actions.sarif \
+        --json-output results/yaml-scan.json \
         "$SCAN_PATH"
+      echo $? > results/yaml-scan.exitcode
+      set -e
 
-      status=$?
-      echo "$status" > results/semgrep-github-actions.exitcode
-
-      if [ ! -f results/semgrep-github-actions.json ]; then
-        printf '{"results":[],"errors":[{"message":"semgrep github-actions scan did not produce JSON"}]}\n' \
-          > results/semgrep-github-actions.json
-      fi
-
-      exit 0
-
-  - name: Run Semgrep managed Supply Chain scan
-    shell: bash
+  - name: Run Semgrep Supply Chain
     run: |
       set +e
-
-      if [ -z "${SEMGREP_APP_TOKEN:-}" ]; then
-        printf '{"results":[],"errors":[{"message":"SEMGREP_APP_TOKEN is missing; supply chain scan skipped"}]}\n' \
-          > results/semgrep-supply-chain.json
-        echo "skipped" > results/semgrep-supply-chain.exitcode
-        exit 0
-      fi
-
       semgrep ci \
         --supply-chain \
-        --json-output results/semgrep-supply-chain.json \
-        --sarif-output results/semgrep-supply-chain.sarif
+        --json-output results/supply-chain.json
+      echo $? > results/supply-chain.exitcode
+      set -e
 
-      status=$?
-      echo "$status" > results/semgrep-supply-chain.exitcode
-
-      if [ ! -f results/semgrep-supply-chain.json ]; then
-        printf '{"results":[],"errors":[{"message":"semgrep supply chain scan did not produce JSON"}]}\n' \
-          > results/semgrep-supply-chain.json
-      fi
-
-      exit 0
-
-  - name: Compare Semgrep outputs
-    shell: bash
+  - name: Compare result counts
     run: |
-      set -euo pipefail
-
       python3 <<'PY'
-      import csv
       import json
+      import csv
       from collections import Counter
       from pathlib import Path
 
-      result_dir = Path("results")
-
-      scans = [
-          ("github-actions-yaml", result_dir / "semgrep-github-actions.json"),
-          ("supply-chain", result_dir / "semgrep-supply-chain.json"),
-      ]
-
-      def load_results(scan_name, path):
-          try:
-              data = json.loads(path.read_text())
-          except Exception as exc:
-              return [], [f"{scan_name}: could not read {path}: {exc}"]
-
-          errors = []
-          for err in data.get("errors", []) or []:
-              if isinstance(err, dict):
-                  errors.append(f"{scan_name}: {err.get('message', err)}")
-              else:
-                  errors.append(f"{scan_name}: {err}")
-
-          rows = []
-          for item in data.get("results", []) or []:
-              extra = item.get("extra", {}) or {}
-              start = item.get("start", {}) or {}
-              end = item.get("end", {}) or {}
-
-              rows.append({
-                  "scan": scan_name,
-                  "path": item.get("path", ""),
-                  "check_id": item.get("check_id", ""),
-                  "severity": extra.get("severity", ""),
-                  "message": extra.get("message", "").replace("\n", " "),
-                  "start_line": start.get("line", ""),
-                  "end_line": end.get("line", ""),
-              })
-
-          return rows, errors
-
-      all_rows = []
-      all_errors = []
-
-      for scan_name, path in scans:
-          rows, errors = load_results(scan_name, path)
-          all_rows.extend(rows)
-          all_errors.extend(errors)
-
-      csv_path = result_dir / "semgrep-combined-findings.csv"
-      with csv_path.open("w", newline="") as fh:
-          writer = csv.DictWriter(
-              fh,
-              fieldnames=[
-                  "scan",
-                  "path",
-                  "check_id",
-                  "severity",
-                  "message",
-                  "start_line",
-                  "end_line",
-              ],
-          )
-          writer.writeheader()
-          writer.writerows(all_rows)
-
-      by_scan = Counter(row["scan"] for row in all_rows)
-      by_scan_rule = Counter((row["scan"], row["check_id"]) for row in all_rows)
-      by_scan_severity = Counter((row["scan"], row["severity"]) for row in all_rows)
-
-      yaml_keys = {
-          (row["path"], row["check_id"], row["start_line"], row["message"])
-          for row in all_rows
-          if row["scan"] == "github-actions-yaml"
+      files = {
+          "yaml_rules": Path("results/yaml-scan.json"),
+          "supply_chain": Path("results/supply-chain.json"),
       }
 
-      sca_keys = {
-          (row["path"], row["check_id"], row["start_line"], row["message"])
-          for row in all_rows
-          if row["scan"] == "supply-chain"
-      }
+      rows = []
+      summary = []
 
-      md = []
-      md.append("# Semgrep comparison summary\n")
-      md.append("## Finding counts by scan\n")
-      md.append("| Scan | Findings |")
-      md.append("|---|---:|")
-      for scan_name, _ in scans:
-          md.append(f"| {scan_name} | {by_scan.get(scan_name, 0)} |")
+      for scan_name, path in files.items():
+          if not path.exists():
+              summary.append([scan_name, "missing_output", 0])
+              continue
 
-      md.append("\n## Finding counts by severity\n")
-      md.append("| Scan | Severity | Findings |")
+          data = json.loads(path.read_text())
+          results = data.get("results", [])
+
+          summary.append([scan_name, "total_findings", len(results)])
+
+          by_rule = Counter(r.get("check_id", "unknown") for r in results)
+          for rule, count in sorted(by_rule.items()):
+              rows.append([scan_name, rule, count])
+
+      with open("results/simple-summary.csv", "w", newline="") as f:
+          writer = csv.writer(f)
+          writer.writerow(["scan", "metric", "count"])
+          writer.writerows(summary)
+
+      with open("results/rules-count.csv", "w", newline="") as f:
+          writer = csv.writer(f)
+          writer.writerow(["scan", "rule", "count"])
+          writer.writerows(rows)
+
+      md = ["# Simple Semgrep comparison", ""]
+      md.append("## Total findings")
+      md.append("| Scan | Metric | Count |")
       md.append("|---|---|---:|")
-      for (scan_name, severity), count in sorted(by_scan_severity.items()):
-          md.append(f"| {scan_name} | {severity or 'unknown'} | {count} |")
+      for row in summary:
+          md.append(f"| {row[0]} | {row[1]} | {row[2]} |")
 
-      md.append("\n## Finding counts by rule\n")
-      md.append("| Scan | Rule | Findings |")
+      md.append("")
+      md.append("## Findings by rule")
+      md.append("| Scan | Rule | Count |")
       md.append("|---|---|---:|")
-      for (scan_name, rule), count in sorted(by_scan_rule.items()):
-          md.append(f"| {scan_name} | `{rule or 'unknown'}` | {count} |")
+      for scan, rule, count in rows:
+          md.append(f"| {scan} | `{rule}` | {count} |")
 
-      md.append("\n## Cross-scan overlap\n")
-      md.append("| Comparison | Count |")
-      md.append("|---|---:|")
-      md.append(f"| Only in GitHub Actions YAML scan | {len(yaml_keys - sca_keys)} |")
-      md.append(f"| Only in Supply Chain scan | {len(sca_keys - yaml_keys)} |")
-      md.append(f"| Present in both | {len(yaml_keys & sca_keys)} |")
-
-      if all_errors:
-          md.append("\n## Scan errors or skipped scans\n")
-          for err in all_errors:
-              md.append(f"- {err}")
-
-      md.append("\n## Files scanned\n")
-      files_path = result_dir / "scanned-yaml-files.txt"
-      if files_path.exists():
-          files = [line.strip() for line in files_path.read_text().splitlines() if line.strip()]
-          md.append(f"YAML file count: {len(files)}")
-          md.append("")
-          for file in files[:25]:
-              md.append(f"- `{file}`")
-          if len(files) > 25:
-              md.append(f"- ... {len(files) - 25} more files")
-
-      summary = "\n".join(md) + "\n"
-      (result_dir / "semgrep-comparison.md").write_text(summary)
-      print(summary)
+      Path("results/comparison.md").write_text("\n".join(md) + "\n")
+      print("\n".join(md))
       PY
 
-  - name: Add comparison to job summary
-    if: always()
-    shell: bash
-    run: |
-      if [ -f results/semgrep-comparison.md ]; then
-        cat results/semgrep-comparison.md >> "$GITHUB_STEP_SUMMARY"
-      fi
+  - name: Add summary to GitHub Actions page
+    run: cat results/comparison.md >> "$GITHUB_STEP_SUMMARY"
 
-  - name: Upload GitHub Actions YAML SARIF
-    if: always() && hashFiles('results/semgrep-github-actions.sarif') != ''
-    uses: github/codeql-action/upload-sarif@v4
-    with:
-      sarif_file: results/semgrep-github-actions.sarif
-      category: semgrep-github-actions-yaml
-
-  - name: Upload Supply Chain SARIF
-    if: always() && hashFiles('results/semgrep-supply-chain.sarif') != ''
-    uses: github/codeql-action/upload-sarif@v4
-    with:
-      sarif_file: results/semgrep-supply-chain.sarif
-      category: semgrep-supply-chain
-
-  - name: Upload raw Semgrep comparison artifacts
-    if: always()
+  - name: Upload results
     uses: actions/upload-artifact@v4
     with:
-      name: semgrep-yaml-benchmark-results
+      name: simple-semgrep-comparison
       path: results/
-      if-no-files-found: error
 ```
