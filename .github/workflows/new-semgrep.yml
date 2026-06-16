@@ -1,0 +1,96 @@
+# .github/workflows/semgrep-ssc-compare.yml
+#
+# Compares two Semgrep modes over your workflow dataset on every push:
+#   legacy : semgrep scan --config p/github-actions   (the paper's usage; OSS, no cloud)
+#   full   : semgrep ci                                (Policy + Pro engine; uploads to dashboard)
+#
+# IMPORTANT FIX: your dataset is at dataset/workflows/, but Semgrep's
+# p/github-actions rules are path-scoped to .github/workflows/. Scanning
+# dataset/workflows/ directly makes those rules skip every file (~0 findings).
+# So we stage the dataset into .github/workflows/ INSIDE THE RUNNER and scan
+# there. This copy is ephemeral and never committed/pushed, so GitHub never
+# executes these foreign workflows — it's just files on disk for the scanner.
+#
+# Requires the SEMGREP_APP_TOKEN repository secret (already configured).
+
+name: semgrep-supply-chain-compare
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep   # pin to a digest in production
+    env:
+      SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4   # pin to a commit SHA in production
+        with:
+          fetch-depth: 0
+
+      # --- Stage the dataset so path-scoped GitHub Actions rules apply -------
+      - name: Stage dataset into .github/workflows
+        run: |
+          mkdir -p .github/workflows
+          # Copy every dataset workflow next to this harness file. Filenames in
+          # the dataset are unique (org-prefixed), so no collisions.
+          find dataset/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) \
+            -exec cp {} .github/workflows/ \;
+          echo "staged $(find .github/workflows -name '*.y*ml' | wc -l) workflow files"
+          # For the full (whole-repo) ci scan, ignore the originals so the same
+          # content isn't scanned twice; we scan the staged copies instead.
+          echo 'dataset/' > .semgrepignore
+
+      # --- Legacy: the paper's local CLI usage, OSS engine, no cloud ---------
+      - name: Legacy (semgrep scan, p/github-actions, no cloud)
+        env:
+          SEMGREP_APP_TOKEN: ""   # force pure-OSS, registry-only, like the paper
+        run: |
+          semgrep scan \
+            --config "p/github-actions" \
+            --json --output legacy.json \
+            --metrics=off --disable-version-check --quiet \
+            .github/workflows || true
+
+      # --- Full ci: Policy + Pro engine + cloud. Uploads to dashboard. -------
+      # Scans the whole repo, which now includes the staged .github/workflows/.
+      # To drive rules from YOUR cloud Policy instead, delete the --config lines.
+      - name: Full (semgrep ci, Pro engine + cloud)
+        run: |
+          semgrep ci \
+            --config "p/default" \
+            --config "p/github-actions" \
+            --json-output=full.json || true
+
+      # --- Compare -----------------------------------------------------------
+      - name: Compare results
+        run: |
+          python3 scripts/compare_semgrep.py \
+            --run legacy:legacy.json \
+            --run full:full.json \
+            --out-md  semgrep_compare_report.md \
+            --out-csv semgrep_compare.csv
+          {
+            echo "## Semgrep: full ci vs legacy CLI"
+            cat semgrep_compare_report.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4   # pin to a commit SHA in production
+        with:
+          name: semgrep-comparison
+          path: |
+            legacy.json
+            full.json
+            semgrep_compare_report.md
+            semgrep_compare.csv
+          if-no-files-found: warn
