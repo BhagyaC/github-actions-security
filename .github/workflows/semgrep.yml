@@ -1,154 +1,169 @@
 name: Simple Semgrep Comparison
 
-on:
-  workflow_dispatch:
-    inputs:
-      scan_path:
-        description: "YAML file or folder to scan"
-        required: true
-        default: "github-actions-security/dataset/workflows"
+"on":
+workflow_dispatch:
+inputs:
+scan_path:
+description: "YAML file or folder to scan"
+required: true
+default: "dataset/workflows"
 
 permissions:
-  contents: read
+contents: read
 
 jobs:
-  semgrep-comparison:
-    runs-on: ubuntu-latest
+semgrep-comparison:
+runs-on: ubuntu-latest
 
-    env:
-      SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
-      SCAN_PATH: ${{ github.event.inputs.scan_path }}
+```
+env:
+  SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+  SCAN_PATH: ${{ inputs.scan_path }}
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+steps:
+  - name: Checkout repository
+    uses: actions/checkout@v4
 
-      - name: Install Semgrep
-        run: |
-          python3 -m pip install --upgrade pip
-          python3 -m pip install semgrep
-          semgrep --version
+  - name: Install Semgrep
+    run: |
+      python3 -m pip install --upgrade pip
+      python3 -m pip install semgrep
+      semgrep --version
 
-      - name: Prepare results folder
-        run: mkdir -p results
+  - name: Prepare results folder
+    run: mkdir -p results
 
-      - name: Run Semgrep GitHub Actions YAML scan
-        run: |
-          set +e
+  - name: Check scan path
+    run: |
+      echo "Scanning path: $SCAN_PATH"
 
-          semgrep scan \
-            --config p/github-actions \
-            --json \
-            "$SCAN_PATH" > results/yaml-scan.json
+      if [ ! -e "$SCAN_PATH" ]; then
+        echo "Path does not exist: $SCAN_PATH"
+        exit 1
+      fi
 
-          echo $? > results/yaml-scan.exitcode
+      find "$SCAN_PATH" -type f \( -name "*.yml" -o -name "*.yaml" \) | sort > results/scanned-files.txt
+      echo "YAML files found:"
+      wc -l results/scanned-files.txt
 
-          if [ ! -s results/yaml-scan.json ]; then
-            echo '{"results":[],"errors":["YAML scan produced no JSON output"]}' > results/yaml-scan.json
-          fi
+  - name: Run Semgrep GitHub Actions YAML scan
+    run: |
+      set +e
 
-      - name: Run Semgrep Supply Chain scan
-        run: |
-          set +e
+      semgrep scan \
+        --config p/github-actions \
+        --json \
+        "$SCAN_PATH" > results/yaml-scan.json
 
-          if [ -z "${SEMGREP_APP_TOKEN:-}" ]; then
-            echo '{"results":[],"errors":["SEMGREP_APP_TOKEN is not set, so Supply Chain scan was skipped"]}' > results/supply-chain.json
-            echo "skipped" > results/supply-chain.exitcode
-            exit 0
-          fi
+      echo $? > results/yaml-scan.exitcode
 
-          semgrep ci \
-            --supply-chain \
-            --json > results/supply-chain.json
+      if [ ! -s results/yaml-scan.json ]; then
+        echo '{"results":[],"errors":["YAML scan produced no JSON output"]}' > results/yaml-scan.json
+      fi
 
-          echo $? > results/supply-chain.exitcode
+  - name: Run Semgrep Supply Chain scan
+    run: |
+      set +e
 
-          if [ ! -s results/supply-chain.json ]; then
-            echo '{"results":[],"errors":["Supply Chain scan produced no JSON output"]}' > results/supply-chain.json
-          fi
+      if [ -z "${SEMGREP_APP_TOKEN:-}" ]; then
+        echo '{"results":[],"errors":["SEMGREP_APP_TOKEN is not set, so Supply Chain scan was skipped"]}' > results/supply-chain.json
+        echo "skipped" > results/supply-chain.exitcode
+        exit 0
+      fi
 
-      - name: Compare results
-        run: |
-          python3 <<'PY'
-          import json
-          import csv
-          from pathlib import Path
-          from collections import Counter
+      semgrep ci \
+        --supply-chain \
+        --json > results/supply-chain.json
 
-          result_files = {
-              "github_actions_yaml": Path("results/yaml-scan.json"),
-              "supply_chain": Path("results/supply-chain.json"),
-          }
+      echo $? > results/supply-chain.exitcode
 
-          totals = []
-          rule_rows = []
-          errors = []
+      if [ ! -s results/supply-chain.json ]; then
+        echo '{"results":[],"errors":["Supply Chain scan produced no JSON output"]}' > results/supply-chain.json
+      fi
 
-          for scan_name, path in result_files.items():
-              try:
-                  data = json.loads(path.read_text())
-              except Exception as exc:
-                  totals.append([scan_name, 0])
-                  errors.append(f"{scan_name}: failed to read JSON: {exc}")
-                  continue
+  - name: Compare results
+    run: |
+      python3 <<'PY'
+      import json
+      import csv
+      from pathlib import Path
+      from collections import Counter
 
-              results = data.get("results", [])
-              totals.append([scan_name, len(results)])
+      scans = {
+          "github_actions_yaml": Path("results/yaml-scan.json"),
+          "supply_chain": Path("results/supply-chain.json"),
+      }
 
-              for err in data.get("errors", []):
-                  errors.append(f"{scan_name}: {err}")
+      totals = []
+      rule_rows = []
+      errors = []
 
-              rules = Counter(item.get("check_id", "unknown") for item in results)
-              for rule, count in sorted(rules.items()):
-                  rule_rows.append([scan_name, rule, count])
+      for scan_name, path in scans.items():
+          try:
+              data = json.loads(path.read_text())
+          except Exception as exc:
+              totals.append([scan_name, 0])
+              errors.append(f"{scan_name}: failed to read JSON: {exc}")
+              continue
 
-          with open("results/summary.csv", "w", newline="") as f:
-              writer = csv.writer(f)
-              writer.writerow(["scan", "total_findings"])
-              writer.writerows(totals)
+          findings = data.get("results", [])
+          totals.append([scan_name, len(findings)])
 
-          with open("results/rules.csv", "w", newline="") as f:
-              writer = csv.writer(f)
-              writer.writerow(["scan", "rule", "count"])
-              writer.writerows(rule_rows)
+          for err in data.get("errors", []):
+              errors.append(f"{scan_name}: {err}")
 
-          lines = []
-          lines.append("# Semgrep comparison")
+          counts = Counter(item.get("check_id", "unknown") for item in findings)
+          for rule, count in sorted(counts.items()):
+              rule_rows.append([scan_name, rule, count])
+
+      with open("results/summary.csv", "w", newline="") as f:
+          writer = csv.writer(f)
+          writer.writerow(["scan", "total_findings"])
+          writer.writerows(totals)
+
+      with open("results/rules.csv", "w", newline="") as f:
+          writer = csv.writer(f)
+          writer.writerow(["scan", "rule", "count"])
+          writer.writerows(rule_rows)
+
+      lines = []
+      lines.append("# Semgrep comparison")
+      lines.append("")
+      lines.append("## Total findings")
+      lines.append("")
+      lines.append("| Scan | Total findings |")
+      lines.append("|---|---:|")
+
+      for scan_name, count in totals:
+          lines.append(f"| {scan_name} | {count} |")
+
+      lines.append("")
+      lines.append("## Findings by rule")
+      lines.append("")
+      lines.append("| Scan | Rule | Count |")
+      lines.append("|---|---|---:|")
+
+      for scan_name, rule, count in rule_rows:
+          lines.append(f"| {scan_name} | `{rule}` | {count} |")
+
+      if errors:
           lines.append("")
-          lines.append("## Total findings")
+          lines.append("## Errors or skipped scans")
           lines.append("")
-          lines.append("| Scan | Total findings |")
-          lines.append("|---|---:|")
 
-          for scan_name, count in totals:
-              lines.append(f"| {scan_name} | {count} |")
+          for err in errors:
+              lines.append(f"- {err}")
 
-          lines.append("")
-          lines.append("## Findings by rule")
-          lines.append("")
-          lines.append("| Scan | Rule | Count |")
-          lines.append("|---|---|---:|")
+      Path("results/comparison.md").write_text("\n".join(lines) + "\n")
+      print("\n".join(lines))
+      PY
 
-          for scan_name, rule, count in rule_rows:
-              lines.append(f"| {scan_name} | `{rule}` | {count} |")
+  - name: Add comparison to GitHub summary
+    run: cat results/comparison.md >> "$GITHUB_STEP_SUMMARY"
 
-          if errors:
-              lines.append("")
-              lines.append("## Errors or skipped scans")
-              lines.append("")
-
-              for err in errors:
-                  lines.append(f"- {err}")
-
-          Path("results/comparison.md").write_text("\n".join(lines) + "\n")
-          print("\n".join(lines))
-          PY
-
-      - name: Add comparison to GitHub summary
-        run: cat results/comparison.md >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload comparison results
-        uses: actions/upload-artifact@v4
-        with:
-          name: semgrep-simple-comparison
-          path: results/
+  - name: Upload comparison results
+    uses: actions/upload-artifact@v4
+    with:
+      name: semgrep-simple-comparison
+      path: results/
+```
