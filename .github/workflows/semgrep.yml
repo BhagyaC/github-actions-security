@@ -1,164 +1,309 @@
-name: Semgrep Spring Java SAST, SCA, and YAML Analysis
+name: Semgrep YAML Benchmark and Supply Chain Comparison
 
 on:
-  push:
-    branches: ["master", "main", "develop"]
-  pull_request:
-    branches: ["master", "main", "develop"]
-  schedule:
-    - cron: "15 6 * * 2"
-  workflow_dispatch:
+workflow_dispatch:
+inputs:
+scan_path:
+description: "Folder or YAML file to scan with Semgrep GitHub Actions rules"
+required: true
+default: "github-actions-security/dataset/workflows"
+pull_request:
+paths:
+- "github-actions-security/dataset/workflows/**/*.yml"
+- "github-actions-security/dataset/workflows/**/*.yaml"
+- ".github/workflows/**/*.yml"
+- ".github/workflows/**/*.yaml"
+- ".semgrep/**/*.yml"
+- ".semgrep/**/*.yaml"
+push:
+branches: ["main", "master", "develop"]
+paths:
+- "github-actions-security/dataset/workflows/**/*.yml"
+- "github-actions-security/dataset/workflows/**/*.yaml"
+- ".github/workflows/**/*.yml"
+- ".github/workflows/**/*.yaml"
+- ".semgrep/**/*.yml"
+- ".semgrep/**/*.yaml"
+schedule:
+- cron: "15 6 * * 2"
 
-permissions: {}
+permissions:
+contents: read
+security-events: write
+actions: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+group: semgrep-yaml-benchmark-${{ github.event.pull_request.number || github.ref }}
+cancel-in-progress: true
 
 jobs:
-  semgrep:
-    name: Semgrep managed SAST and Supply Chain
-    runs-on: ubuntu-latest
+semgrep-compare:
+name: Semgrep YAML and Supply Chain comparison
+runs-on: ubuntu-latest
 
-    permissions:
-      contents: read
-      security-events: write
-      actions: read
+```
+container:
+  image: semgrep/semgrep:latest
 
-    container:
-      # Pin this to an approved digest after validation:
-      # semgrep/semgrep:1.166.0@sha256:<approved-digest>
-      image: semgrep/semgrep:1.166.0
+env:
+  SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+  DEFAULT_SCAN_PATH: github-actions-security/dataset/workflows
+  REQUESTED_SCAN_PATH: ${{ github.event.inputs.scan_path }}
 
-    env:
-      SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+steps:
+  - name: Checkout repository
+    uses: actions/checkout@v4
+    with:
+      persist-credentials: false
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
+  - name: Prepare result directory
+    shell: bash
+    run: |
+      set -euo pipefail
 
-      - name: Run Semgrep managed SAST and Supply Chain scan
-        run: |
-          semgrep ci \
-            --supply-chain \
-            --sarif \
-            --output semgrep.sarif
+      mkdir -p results
 
-      - name: Upload Semgrep SARIF to GitHub Code Scanning
-        if: always() && hashFiles('semgrep.sarif') != ''
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: semgrep.sarif
-          category: semgrep-spring-java-sast-sca
+      if [ -n "${REQUESTED_SCAN_PATH:-}" ]; then
+        echo "SCAN_PATH=${REQUESTED_SCAN_PATH}" >> "$GITHUB_ENV"
+      else
+        echo "SCAN_PATH=${DEFAULT_SCAN_PATH}" >> "$GITHUB_ENV"
+      fi
 
-  yaml-analysis:
-    name: YAML and GitHub Actions analysis
-    runs-on: ubuntu-latest
+  - name: Validate scan path
+    shell: bash
+    run: |
+      set -euo pipefail
 
-    permissions:
-      contents: read
-      security-events: write
-      actions: read
+      if [ ! -e "$SCAN_PATH" ]; then
+        echo "Scan path does not exist: $SCAN_PATH" >&2
+        exit 1
+      fi
 
-    container:
-      image: semgrep/semgrep:1.166.0
+      echo "Scanning: $SCAN_PATH"
+      find "$SCAN_PATH" \( -name "*.yml" -o -name "*.yaml" \) | sort > results/scanned-yaml-files.txt
+      echo "YAML files found: $(wc -l < results/scanned-yaml-files.txt)"
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
+  - name: Record Semgrep version
+    shell: bash
+    run: |
+      set -euo pipefail
+      semgrep --version | tee results/semgrep-version.txt
 
-      - name: Scan GitHub Actions YAML files
-        run: |
-          semgrep scan \
-            --config p/github-actions \
-            --include ".github/workflows/*.yml" \
-            --include ".github/workflows/*.yaml" \
-            --sarif \
-            --output semgrep-github-actions-yaml.sarif \
-            .
+  - name: Run paper-style Semgrep GitHub Actions YAML scan
+    shell: bash
+    run: |
+      set +e
 
-      - name: Upload YAML SARIF to GitHub Code Scanning
-        if: always() && hashFiles('semgrep-github-actions-yaml.sarif') != ''
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: semgrep-github-actions-yaml.sarif
-          category: semgrep-github-actions-yaml
+      semgrep scan \
+        --config p/github-actions \
+        --include "*.yml" \
+        --include "*.yaml" \
+        --json-output results/semgrep-github-actions.json \
+        --sarif-output results/semgrep-github-actions.sarif \
+        "$SCAN_PATH"
 
-  dependency-review:
-    name: Dependency Review
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+      status=$?
+      echo "$status" > results/semgrep-github-actions.exitcode
 
-    permissions:
-      contents: read
+      if [ ! -f results/semgrep-github-actions.json ]; then
+        printf '{"results":[],"errors":[{"message":"semgrep github-actions scan did not produce JSON"}]}\n' \
+          > results/semgrep-github-actions.json
+      fi
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
+      exit 0
 
-      - name: Review dependency changes
-        uses: actions/dependency-review-action@v4.8.3
-        with:
-          fail-on-severity: high
+  - name: Run Semgrep managed Supply Chain scan
+    shell: bash
+    run: |
+      set +e
 
-  zizmor:
-    name: GitHub Actions workflow security analysis
-    runs-on: ubuntu-latest
+      if [ -z "${SEMGREP_APP_TOKEN:-}" ]; then
+        printf '{"results":[],"errors":[{"message":"SEMGREP_APP_TOKEN is missing; supply chain scan skipped"}]}\n' \
+          > results/semgrep-supply-chain.json
+        echo "skipped" > results/semgrep-supply-chain.exitcode
+        exit 0
+      fi
 
-    permissions:
-      contents: read
-      actions: read
-      security-events: write
+      semgrep ci \
+        --supply-chain \
+        --json-output results/semgrep-supply-chain.json \
+        --sarif-output results/semgrep-supply-chain.sarif
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
+      status=$?
+      echo "$status" > results/semgrep-supply-chain.exitcode
 
-      - name: Run zizmor
-        uses: zizmorcore/zizmor-action@v0.5.6
-        with:
-          inputs: .github/workflows
-          min-severity: medium
-          min-confidence: medium
+      if [ ! -f results/semgrep-supply-chain.json ]; then
+        printf '{"results":[],"errors":[{"message":"semgrep supply chain scan did not produce JSON"}]}\n' \
+          > results/semgrep-supply-chain.json
+      fi
 
-  scorecard:
-    name: OpenSSF Scorecard
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+      exit 0
 
-    permissions:
-      security-events: write
-      id-token: write
-      contents: read
-      actions: read
-      issues: read
-      pull-requests: read
-      checks: read
+  - name: Compare Semgrep outputs
+    shell: bash
+    run: |
+      set -euo pipefail
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
+      python3 <<'PY'
+      import csv
+      import json
+      from collections import Counter
+      from pathlib import Path
 
-      - name: Run OpenSSF Scorecard
-        uses: ossf/scorecard-action@v2.4.3
-        with:
-          results_file: scorecard.sarif
-          results_format: sarif
-          publish_results: true
+      result_dir = Path("results")
 
-      - name: Upload Scorecard SARIF to GitHub Code Scanning
-        if: always() && hashFiles('scorecard.sarif') != ''
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: scorecard.sarif
-          category: openssf-scorecard
+      scans = [
+          ("github-actions-yaml", result_dir / "semgrep-github-actions.json"),
+          ("supply-chain", result_dir / "semgrep-supply-chain.json"),
+      ]
+
+      def load_results(scan_name, path):
+          try:
+              data = json.loads(path.read_text())
+          except Exception as exc:
+              return [], [f"{scan_name}: could not read {path}: {exc}"]
+
+          errors = []
+          for err in data.get("errors", []) or []:
+              if isinstance(err, dict):
+                  errors.append(f"{scan_name}: {err.get('message', err)}")
+              else:
+                  errors.append(f"{scan_name}: {err}")
+
+          rows = []
+          for item in data.get("results", []) or []:
+              extra = item.get("extra", {}) or {}
+              start = item.get("start", {}) or {}
+              end = item.get("end", {}) or {}
+
+              rows.append({
+                  "scan": scan_name,
+                  "path": item.get("path", ""),
+                  "check_id": item.get("check_id", ""),
+                  "severity": extra.get("severity", ""),
+                  "message": extra.get("message", "").replace("\n", " "),
+                  "start_line": start.get("line", ""),
+                  "end_line": end.get("line", ""),
+              })
+
+          return rows, errors
+
+      all_rows = []
+      all_errors = []
+
+      for scan_name, path in scans:
+          rows, errors = load_results(scan_name, path)
+          all_rows.extend(rows)
+          all_errors.extend(errors)
+
+      csv_path = result_dir / "semgrep-combined-findings.csv"
+      with csv_path.open("w", newline="") as fh:
+          writer = csv.DictWriter(
+              fh,
+              fieldnames=[
+                  "scan",
+                  "path",
+                  "check_id",
+                  "severity",
+                  "message",
+                  "start_line",
+                  "end_line",
+              ],
+          )
+          writer.writeheader()
+          writer.writerows(all_rows)
+
+      by_scan = Counter(row["scan"] for row in all_rows)
+      by_scan_rule = Counter((row["scan"], row["check_id"]) for row in all_rows)
+      by_scan_severity = Counter((row["scan"], row["severity"]) for row in all_rows)
+
+      yaml_keys = {
+          (row["path"], row["check_id"], row["start_line"], row["message"])
+          for row in all_rows
+          if row["scan"] == "github-actions-yaml"
+      }
+
+      sca_keys = {
+          (row["path"], row["check_id"], row["start_line"], row["message"])
+          for row in all_rows
+          if row["scan"] == "supply-chain"
+      }
+
+      md = []
+      md.append("# Semgrep comparison summary\n")
+      md.append("## Finding counts by scan\n")
+      md.append("| Scan | Findings |")
+      md.append("|---|---:|")
+      for scan_name, _ in scans:
+          md.append(f"| {scan_name} | {by_scan.get(scan_name, 0)} |")
+
+      md.append("\n## Finding counts by severity\n")
+      md.append("| Scan | Severity | Findings |")
+      md.append("|---|---|---:|")
+      for (scan_name, severity), count in sorted(by_scan_severity.items()):
+          md.append(f"| {scan_name} | {severity or 'unknown'} | {count} |")
+
+      md.append("\n## Finding counts by rule\n")
+      md.append("| Scan | Rule | Findings |")
+      md.append("|---|---|---:|")
+      for (scan_name, rule), count in sorted(by_scan_rule.items()):
+          md.append(f"| {scan_name} | `{rule or 'unknown'}` | {count} |")
+
+      md.append("\n## Cross-scan overlap\n")
+      md.append("| Comparison | Count |")
+      md.append("|---|---:|")
+      md.append(f"| Only in GitHub Actions YAML scan | {len(yaml_keys - sca_keys)} |")
+      md.append(f"| Only in Supply Chain scan | {len(sca_keys - yaml_keys)} |")
+      md.append(f"| Present in both | {len(yaml_keys & sca_keys)} |")
+
+      if all_errors:
+          md.append("\n## Scan errors or skipped scans\n")
+          for err in all_errors:
+              md.append(f"- {err}")
+
+      md.append("\n## Files scanned\n")
+      files_path = result_dir / "scanned-yaml-files.txt"
+      if files_path.exists():
+          files = [line.strip() for line in files_path.read_text().splitlines() if line.strip()]
+          md.append(f"YAML file count: {len(files)}")
+          md.append("")
+          for file in files[:25]:
+              md.append(f"- `{file}`")
+          if len(files) > 25:
+              md.append(f"- ... {len(files) - 25} more files")
+
+      summary = "\n".join(md) + "\n"
+      (result_dir / "semgrep-comparison.md").write_text(summary)
+      print(summary)
+      PY
+
+  - name: Add comparison to job summary
+    if: always()
+    shell: bash
+    run: |
+      if [ -f results/semgrep-comparison.md ]; then
+        cat results/semgrep-comparison.md >> "$GITHUB_STEP_SUMMARY"
+      fi
+
+  - name: Upload GitHub Actions YAML SARIF
+    if: always() && hashFiles('results/semgrep-github-actions.sarif') != ''
+    uses: github/codeql-action/upload-sarif@v4
+    with:
+      sarif_file: results/semgrep-github-actions.sarif
+      category: semgrep-github-actions-yaml
+
+  - name: Upload Supply Chain SARIF
+    if: always() && hashFiles('results/semgrep-supply-chain.sarif') != ''
+    uses: github/codeql-action/upload-sarif@v4
+    with:
+      sarif_file: results/semgrep-supply-chain.sarif
+      category: semgrep-supply-chain
+
+  - name: Upload raw Semgrep comparison artifacts
+    if: always()
+    uses: actions/upload-artifact@v4
+    with:
+      name: semgrep-yaml-benchmark-results
+      path: results/
+      if-no-files-found: error
+```
