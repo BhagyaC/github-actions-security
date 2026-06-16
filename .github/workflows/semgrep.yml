@@ -1,169 +1,91 @@
-name: Simple Semgrep Comparison
+# .github/workflows/semgrep-ssc-compare.yml
+#
+# Compares two Semgrep MODES over the same repo on every push:
+#
+#   legacy : semgrep scan --config p/github-actions   (the paper's usage)
+#            -> token blanked => pure local OSS engine, registry rules only, no upload
+#   full   : semgrep ci  (Policy + Pro engine = full potential)
+#            -> uploads to your Semgrep AppSec Platform dashboard
+#
+# `semgrep ci` does a FULL scan on push (correct for a static corpus) and a
+# diff-aware scan on pull_request. It auto-applies the Pro Engine (cross-function
+# analysis) and your org Policy. NOTE: the Pro *interfile* engine does not cover
+# YAML, and Supply Chain (SSC) scans dependency manifests, not workflow YAML — so
+# for a pure workflow corpus, ci's gains are rule breadth + severity tiering +
+# autofix + triage, not cross-file taint.
+#
+# Requires the SEMGREP_APP_TOKEN repository secret (already configured).
 
-"on":
-workflow_dispatch:
-inputs:
-scan_path:
-description: "YAML file or folder to scan"
-required: true
-default: "dataset/workflows"
+name: semgrep-supply-chain-compare
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch: {}
+  # pull_request: {}   # enable for diff-aware PR scans (canonical semgrep ci flow)
 
 permissions:
-contents: read
+  contents: read
 
 jobs:
-semgrep-comparison:
-runs-on: ubuntu-latest
+  scan:
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep   # pin to a digest in production
+    env:
+      SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4   # pin to a commit SHA in production
+        with:
+          fetch-depth: 0
 
-```
-env:
-  SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
-  SCAN_PATH: ${{ inputs.scan_path }}
+      # --- Legacy: the paper's local CLI usage, OSS engine, no cloud ---------
+      # Whole-repo scan, but p/github-actions only matches workflow YAML, so this
+      # is equivalent to scanning dataset/workflows with those 3 rules.
+      - name: Legacy (semgrep scan, p/github-actions, no cloud)
+        env:
+          SEMGREP_APP_TOKEN: ""   # force pure-OSS, registry-only, like the paper
+        run: |
+          semgrep scan \
+            --config "p/github-actions" \
+            --json --output legacy.json \
+            --metrics=off --disable-version-check --quiet \
+            . || true
 
-steps:
-  - name: Checkout repository
-    uses: actions/checkout@v4
+      # --- Full ci: Policy + Pro engine + cloud. Uploads to dashboard. -------
+      # Default forces broad rules so the comparison is reproducible and always
+      # has GitHub Actions coverage. To instead use YOUR cloud Policy as the
+      # source of truth (truest "potential of your setup"), delete both --config
+      # lines: `semgrep ci --json-output=full.json`.
+      - name: Full (semgrep ci, Pro engine + cloud)
+        run: |
+          semgrep ci \
+            --config "p/default" \
+            --config "p/github-actions" \
+            --json-output=full.json || true
 
-  - name: Install Semgrep
-    run: |
-      python3 -m pip install --upgrade pip
-      python3 -m pip install semgrep
-      semgrep --version
+      # --- Compare -----------------------------------------------------------
+      - name: Compare results
+        run: |
+          python3 scripts/compare_semgrep.py \
+            --run legacy:legacy.json \
+            --run full:full.json \
+            --out-md  semgrep_compare_report.md \
+            --out-csv semgrep_compare.csv
+          {
+            echo "## Semgrep: full ci vs legacy CLI"
+            cat semgrep_compare_report.md
+          } >> "$GITHUB_STEP_SUMMARY"
 
-  - name: Prepare results folder
-    run: mkdir -p results
-
-  - name: Check scan path
-    run: |
-      echo "Scanning path: $SCAN_PATH"
-
-      if [ ! -e "$SCAN_PATH" ]; then
-        echo "Path does not exist: $SCAN_PATH"
-        exit 1
-      fi
-
-      find "$SCAN_PATH" -type f \( -name "*.yml" -o -name "*.yaml" \) | sort > results/scanned-files.txt
-      echo "YAML files found:"
-      wc -l results/scanned-files.txt
-
-  - name: Run Semgrep GitHub Actions YAML scan
-    run: |
-      set +e
-
-      semgrep scan \
-        --config p/github-actions \
-        --json \
-        "$SCAN_PATH" > results/yaml-scan.json
-
-      echo $? > results/yaml-scan.exitcode
-
-      if [ ! -s results/yaml-scan.json ]; then
-        echo '{"results":[],"errors":["YAML scan produced no JSON output"]}' > results/yaml-scan.json
-      fi
-
-  - name: Run Semgrep Supply Chain scan
-    run: |
-      set +e
-
-      if [ -z "${SEMGREP_APP_TOKEN:-}" ]; then
-        echo '{"results":[],"errors":["SEMGREP_APP_TOKEN is not set, so Supply Chain scan was skipped"]}' > results/supply-chain.json
-        echo "skipped" > results/supply-chain.exitcode
-        exit 0
-      fi
-
-      semgrep ci \
-        --supply-chain \
-        --json > results/supply-chain.json
-
-      echo $? > results/supply-chain.exitcode
-
-      if [ ! -s results/supply-chain.json ]; then
-        echo '{"results":[],"errors":["Supply Chain scan produced no JSON output"]}' > results/supply-chain.json
-      fi
-
-  - name: Compare results
-    run: |
-      python3 <<'PY'
-      import json
-      import csv
-      from pathlib import Path
-      from collections import Counter
-
-      scans = {
-          "github_actions_yaml": Path("results/yaml-scan.json"),
-          "supply_chain": Path("results/supply-chain.json"),
-      }
-
-      totals = []
-      rule_rows = []
-      errors = []
-
-      for scan_name, path in scans.items():
-          try:
-              data = json.loads(path.read_text())
-          except Exception as exc:
-              totals.append([scan_name, 0])
-              errors.append(f"{scan_name}: failed to read JSON: {exc}")
-              continue
-
-          findings = data.get("results", [])
-          totals.append([scan_name, len(findings)])
-
-          for err in data.get("errors", []):
-              errors.append(f"{scan_name}: {err}")
-
-          counts = Counter(item.get("check_id", "unknown") for item in findings)
-          for rule, count in sorted(counts.items()):
-              rule_rows.append([scan_name, rule, count])
-
-      with open("results/summary.csv", "w", newline="") as f:
-          writer = csv.writer(f)
-          writer.writerow(["scan", "total_findings"])
-          writer.writerows(totals)
-
-      with open("results/rules.csv", "w", newline="") as f:
-          writer = csv.writer(f)
-          writer.writerow(["scan", "rule", "count"])
-          writer.writerows(rule_rows)
-
-      lines = []
-      lines.append("# Semgrep comparison")
-      lines.append("")
-      lines.append("## Total findings")
-      lines.append("")
-      lines.append("| Scan | Total findings |")
-      lines.append("|---|---:|")
-
-      for scan_name, count in totals:
-          lines.append(f"| {scan_name} | {count} |")
-
-      lines.append("")
-      lines.append("## Findings by rule")
-      lines.append("")
-      lines.append("| Scan | Rule | Count |")
-      lines.append("|---|---|---:|")
-
-      for scan_name, rule, count in rule_rows:
-          lines.append(f"| {scan_name} | `{rule}` | {count} |")
-
-      if errors:
-          lines.append("")
-          lines.append("## Errors or skipped scans")
-          lines.append("")
-
-          for err in errors:
-              lines.append(f"- {err}")
-
-      Path("results/comparison.md").write_text("\n".join(lines) + "\n")
-      print("\n".join(lines))
-      PY
-
-  - name: Add comparison to GitHub summary
-    run: cat results/comparison.md >> "$GITHUB_STEP_SUMMARY"
-
-  - name: Upload comparison results
-    uses: actions/upload-artifact@v4
-    with:
-      name: semgrep-simple-comparison
-      path: results/
-```
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4   # pin to a commit SHA in production
+        with:
+          name: semgrep-comparison
+          path: |
+            legacy.json
+            full.json
+            semgrep_compare_report.md
+            semgrep_compare.csv
+          if-no-files-found: warn
